@@ -1,19 +1,19 @@
 #!/bin/bash
 ###############################################################################
-# fix_starlighteye.sh
+# fix_starlighteye.sh  (v3)
 #
 # Repairs a Raspberry Pi 5 (Bookworm) after an apt upgrade overwrote the
 # custom StarlightEye (IMX585) libcamera build with stock RPi packages.
 #
 # What this does:
 #   1. Purges system libcamera + picamera2 packages
-#   2. Cleans any leftover shared libraries
+#   2. Cleans leftover shared libraries AND stale IPA modules
 #   3. Rebuilds will127534's forked libcamera from source
 #   4. Rebuilds forked rpicam-apps from source (libav disabled for Bookworm)
 #   5. Reinstalls pinned python3-libcamera & python3-picamera2 packages
 #   6. Reinstalls the IMX585 v4l2 kernel driver via DKMS
-#   7. Pins libcamera/picamera2 packages so future apt upgrades won't
-#      overwrite them again
+#   7. Pins libcamera/picamera2/libpisp packages so future apt upgrades
+#      won't overwrite them again
 #   8. Verifies config.txt is correct
 #
 # Run as:  sudo bash fix_starlighteye.sh
@@ -35,7 +35,7 @@ err()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 # --- Pre-flight checks -------------------------------------------------------
 [[ $EUID -ne 0 ]] && err "This script must be run as root (sudo)."
 
-log "Starting StarlightEye libcamera repair..."
+log "Starting StarlightEye libcamera repair (v3)..."
 log "Date: $(date)"
 log "Kernel: $(uname -r)"
 log "Python3: $(python3 --version 2>&1)"
@@ -75,15 +75,26 @@ apt-get remove --purge -y \
 
 apt-get autoremove -y 2>/dev/null || true
 
-# --- Step 2: Clean leftover shared objects -----------------------------------
-log "Step 2/8: Cleaning leftover libcamera shared objects..."
+# --- Step 2: Clean ALL leftover shared objects and IPA modules ---------------
+log "Step 2/8: Cleaning leftover libcamera shared objects and IPA modules..."
 
-# Remove any system-installed libcamera .so files that conflict
+# Remove system-installed libcamera .so files
 rm -f /usr/lib/aarch64-linux-gnu/libcamera*.so* 2>/dev/null || true
 rm -f /usr/lib/aarch64-linux-gnu/python3/dist-packages/_libcamera*.so 2>/dev/null || true
 rm -rf /usr/lib/aarch64-linux-gnu/libcamera/ 2>/dev/null || true
 
-# Also clean the local install prefix (from previous ninja install)
+# CRITICAL: Remove stale system IPA modules that conflict with the
+# locally-built ones. If these exist, libcamera loads them instead of
+# the /usr/local/ versions, causing undefined symbol errors against libpisp.
+rm -f /usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_pisp.so 2>/dev/null || true
+rm -f /usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_pisp.so.sign 2>/dev/null || true
+rm -f /usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_vc4.so 2>/dev/null || true
+rm -f /usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_vc4.so.sign 2>/dev/null || true
+
+# Clean the entire system IPA directory to be safe
+rm -rf /usr/lib/aarch64-linux-gnu/libcamera/ 2>/dev/null || true
+
+# Clean the local install prefix (from any previous ninja install)
 rm -f /usr/local/lib/aarch64-linux-gnu/libcamera*.so* 2>/dev/null || true
 rm -rf /usr/local/lib/aarch64-linux-gnu/libcamera/ 2>/dev/null || true
 rm -rf /usr/local/lib/aarch64-linux-gnu/python3*/site-packages/libcamera/ 2>/dev/null || true
@@ -158,6 +169,19 @@ ldconfig
 
 log "Forked libcamera installed successfully."
 
+# Verify that ONLY local IPA modules exist (no stale system copies)
+log "Verifying IPA module paths..."
+if [[ -f /usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_pisp.so ]]; then
+    warn "Stale system IPA module still exists — removing it now."
+    rm -f /usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_pisp.so
+    rm -f /usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_pisp.so.sign
+fi
+if [[ -f /usr/local/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_pisp.so ]]; then
+    log "Local IPA module found at /usr/local/lib/aarch64-linux-gnu/libcamera/ipa/ — correct."
+else
+    warn "Local IPA module not found — libcamera may not work correctly."
+fi
+
 # --- Step 5: Build forked rpicam-apps ----------------------------------------
 log "Step 5/8: Building forked rpicam-apps..."
 
@@ -224,10 +248,10 @@ bash ./setup.sh
 log "IMX585 kernel driver installed."
 
 # --- Step 8: Pin packages to prevent future breakage -------------------------
-log "Step 8/8: Pinning libcamera packages to prevent apt upgrade breakage..."
+log "Step 8/8: Pinning libcamera and libpisp packages to prevent apt upgrade breakage..."
 
 cat > /etc/apt/preferences.d/starlighteye-hold.pref << 'EOF'
-# Hold libcamera and picamera2 at their current versions to prevent
+# Hold libcamera, picamera2, and libpisp at their current versions to prevent
 # apt upgrade from overwriting the StarlightEye custom build.
 
 Package: python3-libcamera
@@ -257,9 +281,25 @@ Pin-Priority: -1
 Package: rpicam-apps
 Pin: release *
 Pin-Priority: -1
+
+# Pin libpisp to prevent ABI mismatch with locally-built IPA modules.
+# The forked libcamera builds its own libpisp via meson wrap/forcefallback,
+# but the system IPA modules link against the apt-installed libpisp.
+# Upgrading libpisp without rebuilding can cause undefined symbol errors.
+Package: libpisp*
+Pin: version 1.2.1-1
+Pin-Priority: 1001
+
+Package: libpisp-common
+Pin: version 1.2.1-1
+Pin-Priority: 1001
 EOF
 
 log "APT pin file created at /etc/apt/preferences.d/starlighteye-hold.pref"
+
+# --- Final cleanup: ensure no stale system IPA modules remain ----------------
+log "Final cleanup: removing any remaining stale system IPA modules..."
+rm -rf /usr/lib/aarch64-linux-gnu/libcamera/ 2>/dev/null || true
 
 # --- Verify config.txt -------------------------------------------------------
 log "Verifying /boot/firmware/config.txt..."
@@ -292,4 +332,6 @@ echo ""
 echo "  If issues persist, check:"
 echo "    dmesg | grep imx585"
 echo "    python3 -c 'from picamera2 import Picamera2; print(\"OK\")'"
+echo "    find /usr -name 'ipa_rpi_pisp*' 2>/dev/null"
+echo "      (should ONLY show /usr/local/... paths)"
 echo ""
