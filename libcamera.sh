@@ -9,7 +9,7 @@
 #   1. Purges system libcamera + picamera2 packages
 #   2. Cleans any leftover shared libraries
 #   3. Rebuilds will127534's forked libcamera from source
-#   4. Rebuilds forked rpicam-apps from source
+#   4. Rebuilds forked rpicam-apps from source (libav disabled for Bookworm)
 #   5. Reinstalls pinned python3-libcamera & python3-picamera2 packages
 #   6. Reinstalls the IMX585 v4l2 kernel driver via DKMS
 #   7. Pins libcamera/picamera2 packages so future apt upgrades won't
@@ -121,10 +121,6 @@ apt-get install -y \
     libjpeg-dev \
     libpng-dev \
     ninja-build \
-    libavcodec-dev \
-    libavdevice-dev \
-    libavformat-dev \
-    libswresample-dev \
     dkms \
     git
 
@@ -171,9 +167,12 @@ rm -rf rpicam-apps
 git clone https://github.com/will127534/rpicam-apps.git
 cd rpicam-apps
 
-# Full desktop OS build (with Qt preview, libav, DRM, EGL)
+# NOTE: libav is DISABLED because Bookworm ships an older libavcodec that
+# is incompatible with rpicam-apps (AV_PROFILE_UNKNOWN / AV_LEVEL_UNKNOWN
+# symbols missing). This does not affect Picamera2 or rpicam-still/rpicam-vid
+# basic functionality. If you need libav encoding, upgrade FFmpeg first.
 meson setup build \
-    -Denable_libav=enabled \
+    -Denable_libav=disabled \
     -Denable_drm=enabled \
     -Denable_egl=enabled \
     -Denable_qt=enabled \
