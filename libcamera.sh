@@ -1,40 +1,21 @@
 #!/bin/bash
 ###############################################################################
-# fix_starlighteye.sh  (v4 — final)
+# fix_starlighteye.sh  (v7)
 #
 # Repairs a Raspberry Pi 5 (Bookworm) after an apt upgrade overwrote the
 # custom StarlightEye (IMX585) libcamera build with stock RPi packages.
 #
-# LESSONS LEARNED (baked into this script):
+# v7 CHANGES:
+#   - Downloads updated wlf8.py from GitHub (replaces existing copy)
+#   - Downloads and extracts icons.zip to ~/icons (replaces existing folder)
 #
-#   - python3-libcamera from apt must NEVER be installed. It ships a
-#     _libcamera.so Python binding compiled against libcamera 0.5, which
-#     is ABI-incompatible with the forked libcamera 0.6 build. The forked
-#     build with -Dpycamera=enabled already produces the correct binding.
+# IMPORTANT: Run via SSH so the build continues when the desktop stops.
+#   ssh pi@<ip-address>
+#   sudo bash fix_starlighteye.sh
 #
-#   - python3-picamera2 from apt is fine — it's pure Python on top.
-#     But it depends on python3-libcamera, so we install with --no-install-recommends
-#     and force-remove python3-libcamera afterward.
-#
-#   - The apt python3-libcamera package pulls in libcamera0.5 which drops
-#     stock .so files into /usr/lib/ AND stale IPA modules into
-#     /usr/lib/aarch64-linux-gnu/libcamera/ipa/. These must be cleaned.
-#
-#   - The locally-built IPA modules live at /usr/local/lib/.../libcamera/ipa/
-#     but libcamera searches /usr/lib/.../libcamera/ipa/ by default.
-#     We symlink the local ones into the system path.
-#
-#   - Tuning JSON files (imx585.json, imx585_mono.json) are installed to
-#     /usr/local/share/ but libcamera looks in /usr/share/. We copy them.
-#
-#   - The .pth file must point to /usr/local/lib/python3/dist-packages
-#     (where the forked _libcamera.so actually lives), NOT to
-#     /usr/local/lib/aarch64-linux-gnu/python3.XX/site-packages.
+# Expected build time on Pi 5 2GB: 60-90 minutes.
 #
 # Run as:  sudo bash fix_starlighteye.sh
-#
-# Tested on Raspberry Pi 5, Bookworm, Python 3.11, kernel 6.6.x
-# Against StarlightEye Quick Start Guide (Jan 2026 revision)
 ###############################################################################
 
 set -euo pipefail
@@ -48,13 +29,22 @@ log()  { echo -e "${GREEN}[FIX]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+PI_HOME="/home/pi"
+
 # --- Pre-flight checks -------------------------------------------------------
 [[ $EUID -ne 0 ]] && err "This script must be run as root (sudo)."
 
-log "Starting StarlightEye libcamera repair (v4)..."
+log "Starting StarlightEye libcamera repair (v7)..."
 log "Date: $(date)"
 log "Kernel: $(uname -r)"
 log "Python3: $(python3 --version 2>&1)"
+
+TOTAL_RAM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+log "Total RAM: ${TOTAL_RAM_MB}MB"
+
+if [[ $TOTAL_RAM_MB -lt 3000 ]]; then
+    log "Low-RAM system detected. Build will use aggressive memory-saving measures."
+fi
 
 PYTHON_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 log "Detected Python version: ${PYTHON_VER}"
@@ -73,12 +63,115 @@ fi
 log "Will use imx585-v4l2-driver branch: ${DRIVER_BRANCH}"
 
 ###############################################################################
+# PRE-BUILD: MEMORY, THERMAL & POWER SAFETY
+###############################################################################
+
+log "=== PRE-BUILD: Maximizing available memory and reducing power draw ==="
+
+# --- Create 4GB swap file ---
+SWAP_CREATED=false
+if ! swapon --show | grep -q "/swapfile"; then
+    log "Creating 4GB swap file (required for 2GB Pi 5)..."
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile
+    dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    SWAP_CREATED=true
+    log "4GB swap enabled."
+else
+    log "Swap already active."
+    SWAP_SIZE=$(swapon --show --bytes --noheadings | awk '{sum+=$3} END {print int(sum/1024/1024)}')
+    if [[ $SWAP_SIZE -lt 2000 ]]; then
+        warn "Existing swap is only ${SWAP_SIZE}MB — may not be enough."
+    else
+        log "Existing swap: ${SWAP_SIZE}MB — sufficient."
+    fi
+fi
+
+# --- Disable zram if active ---
+ZRAM_WAS_ACTIVE=false
+if swapon --show | grep -q "zram"; then
+    log "Disabling zram to free RAM..."
+    for z in /dev/zram*; do
+        swapoff "$z" 2>/dev/null || true
+    done
+    ZRAM_WAS_ACTIVE=true
+fi
+
+# --- Stop desktop environment to free ~300-400MB ---
+DESKTOP_WAS_RUNNING=false
+if systemctl is-active --quiet lightdm 2>/dev/null; then
+    log ""
+    log "================================================================"
+    log "  Stopping desktop environment to free memory for compilation."
+    log "  If running locally, the screen will go blank — this is normal."
+    log "  The build is still running. The desktop will restart when done."
+    log "  For best experience, run this script over SSH instead."
+    log "================================================================"
+    log ""
+    sleep 5
+    systemctl stop lightdm 2>/dev/null || true
+    DESKTOP_WAS_RUNNING=true
+    sleep 2
+    log "Desktop stopped. Freed memory:"
+    free -h | head -2
+fi
+
+# --- Drop filesystem caches ---
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# --- Cap CPU frequency ---
+ORIG_MAX_FREQ=""
+MAX_FREQ_PATH="/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
+if [[ -f "$MAX_FREQ_PATH" ]]; then
+    ORIG_MAX_FREQ=$(cat "$MAX_FREQ_PATH")
+    echo 1500000 | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq > /dev/null 2>&1 || true
+    log "CPU frequency capped at 1.5GHz for build stability."
+fi
+
+# --- Check for undervoltage ---
+if command -v vcgencmd &>/dev/null; then
+    THROTTLE=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
+    if [[ "$THROTTLE" != "0x0" ]]; then
+        warn "Undervoltage/throttling detected (${THROTTLE})!"
+        warn "Use the official Pi 5 27W power supply for best results."
+    else
+        log "Power supply looks good (no throttling detected)."
+    fi
+fi
+
+# Helper: cooldown pause between heavy phases
+cooldown() {
+    local TEMP TEMP_C
+    TEMP=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo "0")
+    TEMP_C=$((TEMP / 1000))
+    if [[ $TEMP_C -gt 70 ]]; then
+        log "CPU at ${TEMP_C}°C — cooling down for 90 seconds..."
+        sleep 90
+    elif [[ $TEMP_C -gt 60 ]]; then
+        log "CPU at ${TEMP_C}°C — cooling down for 45 seconds..."
+        sleep 45
+    else
+        log "CPU at ${TEMP_C}°C — proceeding."
+    fi
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+}
+
+log ""
+log "Available memory before build:"
+free -h | head -2
+log ""
+
+###############################################################################
 # PHASE 1: NUKE EVERYTHING
 ###############################################################################
 
 log "=== PHASE 1: Removing all libcamera / picamera2 packages and artifacts ==="
 
-# Remove every apt package that could conflict
 apt-get remove --purge -y \
     python3-libcamera \
     python3-picamera2 \
@@ -93,32 +186,21 @@ apt-get remove --purge -y \
 
 apt-get autoremove -y 2>/dev/null || true
 
-# Nuke ALL libcamera shared objects from system path
 rm -f  /usr/lib/aarch64-linux-gnu/libcamera*.so*          2>/dev/null || true
 rm -f  /usr/lib/aarch64-linux-gnu/libcamera-base*.so*     2>/dev/null || true
 rm -rf /usr/lib/aarch64-linux-gnu/libcamera/              2>/dev/null || true
-
-# Nuke system Python libcamera bindings
 rm -rf /usr/lib/python3/dist-packages/libcamera/          2>/dev/null || true
 rm -f  /usr/lib/python3/dist-packages/_libcamera*.so      2>/dev/null || true
-
-# Nuke ALL local (previous build) artifacts
 rm -f  /usr/local/lib/aarch64-linux-gnu/libcamera*.so*    2>/dev/null || true
 rm -f  /usr/local/lib/aarch64-linux-gnu/libcamera-base*.so* 2>/dev/null || true
 rm -rf /usr/local/lib/aarch64-linux-gnu/libcamera/        2>/dev/null || true
 rm -rf /usr/local/lib/aarch64-linux-gnu/python3*/site-packages/libcamera/ 2>/dev/null || true
 rm -rf /usr/local/lib/python3/dist-packages/libcamera/    2>/dev/null || true
 rm -f  /usr/local/bin/rpicam-*                            2>/dev/null || true
-
-# Remove old .pth files
-rm -f /usr/local/lib/python${PYTHON_VER}/dist-packages/local-libcamera.pth 2>/dev/null || true
-
-# Remove old environment variable files
-rm -f /etc/environment.d/starlighteye.conf  2>/dev/null || true
-rm -f /etc/profile.d/starlighteye.sh        2>/dev/null || true
-
-# Remove old APT pin file
-rm -f /etc/apt/preferences.d/starlighteye-hold.pref 2>/dev/null || true
+rm -f  /usr/local/lib/python${PYTHON_VER}/dist-packages/local-libcamera.pth 2>/dev/null || true
+rm -f  /etc/environment.d/starlighteye.conf               2>/dev/null || true
+rm -f  /etc/profile.d/starlighteye.sh                     2>/dev/null || true
+rm -f  /etc/apt/preferences.d/starlighteye-hold.pref      2>/dev/null || true
 
 ldconfig
 
@@ -156,7 +238,11 @@ apt-get install -y \
     libpng-dev \
     ninja-build \
     dkms \
-    git
+    git \
+    unzip
+
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
 log "Dependencies installed."
 
@@ -165,6 +251,10 @@ log "Dependencies installed."
 ###############################################################################
 
 log "=== PHASE 3: Building will127534's forked libcamera ==="
+log ""
+log "    !! SINGLE-THREADED BUILD — THIS WILL TAKE 45-90 MINUTES !!"
+log "    !! ON A 2GB PI 5. THIS IS NORMAL. DO NOT POWER OFF.     !!"
+log ""
 
 BUILD_DIR="/home/pi/starlighteye_rebuild"
 mkdir -p "$BUILD_DIR"
@@ -188,26 +278,27 @@ meson setup build \
     -Dpycamera=enabled \
     -Dwrap_mode=forcefallback
 
-ninja -C build
+ninja -j1 -C build
 ninja -C build install
 
 ldconfig
 
 log "Forked libcamera built and installed to /usr/local/."
 
+cooldown
+
 ###############################################################################
 # PHASE 4: BUILD FORKED RPICAM-APPS
 ###############################################################################
 
-log "=== PHASE 4: Building forked rpicam-apps ==="
+log "=== PHASE 4: Building forked rpicam-apps (single-threaded) ==="
+log "    This will take 15-25 minutes."
 
 cd "$BUILD_DIR"
 rm -rf rpicam-apps
 git clone https://github.com/will127534/rpicam-apps.git
 cd rpicam-apps
 
-# libav DISABLED — Bookworm's libavcodec is too old (AV_PROFILE_UNKNOWN missing)
-# This does not affect Picamera2 or rpicam-still/rpicam-vid basic capture.
 meson setup build \
     -Denable_libav=disabled \
     -Denable_drm=enabled \
@@ -216,12 +307,14 @@ meson setup build \
     -Denable_opencv=disabled \
     -Denable_tflite=disabled
 
-meson compile -C build
+meson compile -j1 -C build
 meson install -C build
 
 ldconfig
 
 log "Forked rpicam-apps built and installed."
+
+cooldown
 
 ###############################################################################
 # PHASE 5: INSTALL PICAMERA2 (apt) — BUT NOT python3-libcamera
@@ -229,27 +322,16 @@ log "Forked rpicam-apps built and installed."
 
 log "=== PHASE 5: Installing python3-picamera2 ==="
 
-# We ONLY want picamera2 (pure Python). We do NOT want python3-libcamera
-# from apt because it ships _libcamera.so compiled against libcamera 0.5,
-# which is ABI-incompatible with our forked 0.6 build.
-#
-# However, python3-picamera2 declares a dependency on python3-libcamera.
-# So we install picamera2 first, then immediately force-remove
-# python3-libcamera and libcamera0.5 (which it pulled in).
-
 apt-get install -y python3-picamera2 2>/dev/null || {
     warn "Failed to install python3-picamera2 via apt."
     warn "Trying pip install as fallback..."
     pip install picamera2 --break-system-packages 2>/dev/null || true
 }
 
-# Force-remove the apt python3-libcamera and libcamera0.5 that got dragged in.
-# Use dpkg --force to avoid dependency complaints.
 log "Removing apt python3-libcamera and libcamera0.5 (wrong ABI)..."
 dpkg --force-depends -r python3-libcamera 2>/dev/null || true
 dpkg --force-depends -r libcamera0.5      2>/dev/null || true
 
-# Clean out everything apt just dropped into system paths
 rm -f  /usr/lib/aarch64-linux-gnu/libcamera*.so*       2>/dev/null || true
 rm -f  /usr/lib/aarch64-linux-gnu/libcamera-base*.so*  2>/dev/null || true
 rm -rf /usr/lib/aarch64-linux-gnu/libcamera/           2>/dev/null || true
@@ -266,10 +348,6 @@ log "picamera2 installed, stock libcamera packages removed."
 log "=== PHASE 6: Wiring up IPA modules, tuning files, and Python paths ==="
 
 # --- 6a: IPA modules ---
-# libcamera searches /usr/lib/.../libcamera/ipa/ by default.
-# Our good IPA modules are at /usr/local/lib/.../libcamera/ipa/.
-# Symlink them into the system path.
-
 IPA_SYS="/usr/lib/aarch64-linux-gnu/libcamera/ipa"
 IPA_LOCAL="/usr/local/lib/aarch64-linux-gnu/libcamera/ipa"
 
@@ -285,9 +363,6 @@ for f in ipa_rpi_pisp.so ipa_rpi_pisp.so.sign ipa_rpi_vc4.so ipa_rpi_vc4.so.sign
 done
 
 # --- 6b: Tuning JSON files ---
-# libcamera looks for sensor tuning files in /usr/share/libcamera/ipa/rpi/
-# but the forked build installs them to /usr/local/share/libcamera/ipa/rpi/.
-
 for subdir in pisp vc4; do
     SRC="/usr/local/share/libcamera/ipa/rpi/${subdir}"
     DST="/usr/share/libcamera/ipa/rpi/${subdir}"
@@ -300,10 +375,6 @@ for subdir in pisp vc4; do
 done
 
 # --- 6c: Python bindings ---
-# The forked build installs _libcamera.cpython-3XX.so to:
-#   /usr/local/lib/python3/dist-packages/libcamera/
-# We need Python to find this. Create a .pth file.
-
 PTH_FILE="/usr/local/lib/python${PYTHON_VER}/dist-packages/local-libcamera.pth"
 PTH_TARGET="/usr/local/lib/python3/dist-packages"
 
@@ -312,13 +383,11 @@ echo "$PTH_TARGET" > "$PTH_FILE"
 
 log "  Python .pth: ${PTH_FILE} -> ${PTH_TARGET}"
 
-# Verify the binding exists
 BINDING="${PTH_TARGET}/libcamera/_libcamera.cpython-${PYTHON_VER//./}-aarch64-linux-gnu.so"
 if [[ -f "$BINDING" ]]; then
     log "  Local Python binding found: ${BINDING}"
 else
     warn "  Local Python binding NOT found at expected path!"
-    warn "  Looking for it..."
     find /usr/local -name "_libcamera.cpython*" 2>/dev/null | while read -r p; do
         warn "    Found: ${p}"
     done
@@ -343,16 +412,81 @@ bash ./setup.sh
 log "IMX585 kernel driver installed."
 
 ###############################################################################
-# PHASE 8: PIN PACKAGES & PROTECT AGAINST FUTURE APT UPGRADES
+# PHASE 8: UPDATE APPLICATION FILES (wlf8.py + icons)
 ###############################################################################
 
-log "=== PHASE 8: Pinning packages to prevent future breakage ==="
+log "=== PHASE 8: Updating camera application files ==="
+
+# --- 8a: Download updated wlf8.py ---
+WLF_URL="https://raw.githubusercontent.com/malcolmjay/camerafix/main/wlf8.py"
+WLF_DEST="${PI_HOME}/wlf8.py"
+
+log "  Downloading updated wlf8.py..."
+if [[ -f "$WLF_DEST" ]]; then
+    log "  Removing existing wlf8.py..."
+    rm -f "$WLF_DEST"
+fi
+
+wget -q --show-progress -O "$WLF_DEST" "$WLF_URL" || {
+    warn "  wget failed, trying curl..."
+    curl -fSL -o "$WLF_DEST" "$WLF_URL" || err "Failed to download wlf8.py from GitHub."
+}
+
+chown pi:pi "$WLF_DEST"
+chmod 644 "$WLF_DEST"
+log "  wlf8.py updated at ${WLF_DEST}"
+
+# --- 8b: Download and extract icons.zip ---
+ICONS_URL="https://raw.githubusercontent.com/malcolmjay/camerafix/main/icons.zip"
+ICONS_DIR="${PI_HOME}/icons"
+ICONS_ZIP="${PI_HOME}/icons.zip"
+
+log "  Downloading icons.zip..."
+wget -q --show-progress -O "$ICONS_ZIP" "$ICONS_URL" || {
+    warn "  wget failed, trying curl..."
+    curl -fSL -o "$ICONS_ZIP" "$ICONS_URL" || err "Failed to download icons.zip from GitHub."
+}
+
+# Remove existing icons folder if present
+if [[ -d "$ICONS_DIR" ]]; then
+    log "  Removing existing icons folder..."
+    rm -rf "$ICONS_DIR"
+fi
+
+log "  Extracting icons.zip..."
+unzip -o -q "$ICONS_ZIP" -d "$PI_HOME"
+
+# Fix ownership
+chown -R pi:pi "$ICONS_DIR"
+
+# Clean up zip file
+rm -f "$ICONS_ZIP"
+
+if [[ -d "$ICONS_DIR" ]]; then
+    ICON_COUNT=$(find "$ICONS_DIR" -type f | wc -l)
+    log "  Icons extracted: ${ICON_COUNT} files in ${ICONS_DIR}"
+else
+    warn "  Icons directory not found after extraction — check zip structure."
+    warn "  The zip may extract to a subdirectory. Checking..."
+    # Some zips contain a top-level folder — check for it
+    EXTRACTED=$(find "$PI_HOME" -maxdepth 1 -type d -name "icons*" ! -name "icons" 2>/dev/null | head -1)
+    if [[ -n "$EXTRACTED" ]]; then
+        log "  Found ${EXTRACTED} — renaming to ${ICONS_DIR}"
+        mv "$EXTRACTED" "$ICONS_DIR"
+        chown -R pi:pi "$ICONS_DIR"
+    fi
+fi
+
+log "Application files updated."
+
+###############################################################################
+# PHASE 9: PIN PACKAGES & PROTECT AGAINST FUTURE APT UPGRADES
+###############################################################################
+
+log "=== PHASE 9: Pinning packages to prevent future breakage ==="
 
 cat > /etc/apt/preferences.d/starlighteye-hold.pref << 'EOF'
 # StarlightEye protection: prevent apt upgrade from overwriting custom builds.
-#
-# Block ALL libcamera system packages from being installed/upgraded.
-# The forked libcamera is built from source and lives in /usr/local/.
 
 Package: python3-libcamera
 Pin: release *
@@ -378,12 +512,10 @@ Package: rpicam-apps
 Pin: release *
 Pin-Priority: -1
 
-# Pin picamera2 to prevent it pulling in a newer python3-libcamera
 Package: python3-picamera2
 Pin: version 0.3.31-1
 Pin-Priority: 1001
 
-# Pin libpisp to prevent ABI mismatch with locally-built IPA modules
 Package: libpisp*
 Pin: version 1.2.1*
 Pin-Priority: 1001
@@ -393,13 +525,13 @@ Pin: version 1.2.1*
 Pin-Priority: 1001
 EOF
 
-log "APT pin file created at /etc/apt/preferences.d/starlighteye-hold.pref"
+log "APT pin file created."
 
 ###############################################################################
-# PHASE 9: VERIFY CONFIG.TXT
+# PHASE 10: VERIFY CONFIG.TXT
 ###############################################################################
 
-log "=== PHASE 9: Verifying /boot/firmware/config.txt ==="
+log "=== PHASE 10: Verifying /boot/firmware/config.txt ==="
 
 CONFIG="/boot/firmware/config.txt"
 if [[ -f "$CONFIG" ]]; then
@@ -416,76 +548,98 @@ else
 fi
 
 ###############################################################################
-# PHASE 10: FINAL VERIFICATION
+# POST-BUILD: RESTORE SYSTEM
 ###############################################################################
 
-log "=== PHASE 10: Running verification checks ==="
+log "=== POST-BUILD: Restoring system settings ==="
+
+if [[ -n "$ORIG_MAX_FREQ" && -f "$MAX_FREQ_PATH" ]]; then
+    echo "$ORIG_MAX_FREQ" | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq > /dev/null 2>&1 || true
+    log "CPU frequency restored."
+fi
+
+if $ZRAM_WAS_ACTIVE; then
+    systemctl restart zramswap 2>/dev/null || true
+    log "zram re-enabled."
+fi
+
+if $DESKTOP_WAS_RUNNING; then
+    log "Restarting desktop environment..."
+    systemctl start lightdm 2>/dev/null || true
+    log "Desktop restarted."
+fi
+
+###############################################################################
+# PHASE 11: FINAL VERIFICATION
+###############################################################################
+
+log "=== PHASE 11: Running verification checks ==="
 
 echo ""
 PASS=true
 
-# Check 1: Local libcamera .so exists
-if [[ -f /usr/local/lib/aarch64-linux-gnu/libcamera.so.0.6 ]]; then
-    log "  [PASS] Local libcamera.so.0.6 found"
+IPA_SYS="/usr/lib/aarch64-linux-gnu/libcamera/ipa"
+PTH_TARGET="/usr/local/lib/python3/dist-packages"
+
+if ls /usr/local/lib/aarch64-linux-gnu/libcamera.so* &>/dev/null; then
+    log "  [PASS] Local libcamera .so found"
 else
-    warn "  [FAIL] Local libcamera.so.0.6 NOT found"
-    PASS=false
+    warn "  [FAIL] Local libcamera .so NOT found"; PASS=false
 fi
 
-# Check 2: No stock libcamera .so in system path
 if ls /usr/lib/aarch64-linux-gnu/libcamera.so* &>/dev/null; then
-    warn "  [FAIL] Stock libcamera .so still exists in /usr/lib/"
-    PASS=false
+    warn "  [FAIL] Stock libcamera .so still in /usr/lib/"; PASS=false
 else
     log "  [PASS] No stock libcamera .so in /usr/lib/"
 fi
 
-# Check 3: IPA symlinks in place
 if [[ -L "${IPA_SYS}/ipa_rpi_pisp.so" ]]; then
     log "  [PASS] IPA symlink in place"
 else
-    warn "  [FAIL] IPA symlink missing"
-    PASS=false
+    warn "  [FAIL] IPA symlink missing"; PASS=false
 fi
 
-# Check 4: Tuning files present
 if [[ -f /usr/share/libcamera/ipa/rpi/pisp/imx585_mono.json ]]; then
-    log "  [PASS] IMX585 tuning files present in /usr/share/"
+    log "  [PASS] IMX585 tuning files present"
 else
-    warn "  [FAIL] IMX585 tuning files missing from /usr/share/"
-    PASS=false
+    warn "  [FAIL] IMX585 tuning files missing"; PASS=false
 fi
 
-# Check 5: Python binding
 if [[ -f "${PTH_TARGET}/libcamera/_libcamera.cpython-${PYTHON_VER//./}-aarch64-linux-gnu.so" ]]; then
     log "  [PASS] Local Python libcamera binding found"
 else
-    warn "  [FAIL] Local Python libcamera binding missing"
-    PASS=false
+    warn "  [FAIL] Local Python libcamera binding missing"; PASS=false
 fi
 
-# Check 6: No apt python3-libcamera installed
 if dpkg -l python3-libcamera 2>/dev/null | grep -q "^ii"; then
-    warn "  [FAIL] apt python3-libcamera is still installed — remove it!"
-    PASS=false
+    warn "  [FAIL] apt python3-libcamera still installed"; PASS=false
 else
     log "  [PASS] apt python3-libcamera not installed"
 fi
 
-# Check 7: picamera2 importable
 if python3 -c "import picamera2" 2>/dev/null; then
-    log "  [PASS] picamera2 imports successfully"
+    log "  [PASS] picamera2 imports"
 else
-    warn "  [FAIL] picamera2 import failed"
-    PASS=false
+    warn "  [FAIL] picamera2 import failed"; PASS=false
 fi
 
-# Check 8: libcamera importable from local binding
-if python3 -c "import libcamera; print(f'libcamera loaded from: {libcamera.__file__}')" 2>/dev/null; then
-    log "  [PASS] libcamera Python module imports successfully"
+if python3 -c "import libcamera" 2>/dev/null; then
+    log "  [PASS] libcamera imports"
 else
-    warn "  [FAIL] libcamera Python module import failed"
-    PASS=false
+    warn "  [FAIL] libcamera import failed"; PASS=false
+fi
+
+if [[ -f "${PI_HOME}/wlf8.py" ]]; then
+    log "  [PASS] wlf8.py present at ${PI_HOME}/wlf8.py"
+else
+    warn "  [FAIL] wlf8.py missing from ${PI_HOME}/"; PASS=false
+fi
+
+if [[ -d "${PI_HOME}/icons" ]]; then
+    ICON_COUNT=$(find "${PI_HOME}/icons" -type f | wc -l)
+    log "  [PASS] Icons folder present (${ICON_COUNT} files)"
+else
+    warn "  [FAIL] Icons folder missing from ${PI_HOME}/"; PASS=false
 fi
 
 echo ""
@@ -500,12 +654,11 @@ else
 fi
 
 echo ""
-echo "  Next steps:"
-echo "    1. Reboot:  sudo reboot"
-echo "    2. Test:    rpicam-still -r -o test.jpg -f -t 0"
-echo "    3. Then:    sudo python3 wlf8.py"
+echo "  After reboot, test with:"
+echo "    rpicam-still -r -o test.jpg -f -t 0"
+echo "    sudo python3 wlf8.py"
 echo ""
-echo "  If issues persist, check:"
-echo "    dmesg | grep imx585"
-echo "    sudo python3 -c 'from picamera2 import Picamera2; print(Picamera2.global_camera_info())'"
-echo ""
+
+log "Rebooting in 10 seconds..."
+sleep 10
+sudo reboot
