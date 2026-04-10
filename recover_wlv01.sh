@@ -5,7 +5,7 @@
 
 set -e
 
-IMG_NAME="wlv01.img.gz"
+IMG_NAME="wlv01.gz"
 SD_CARD="/dev/mmcblk0"
 USB_MOUNT="/mnt/usb_recovery"
 
